@@ -1,8 +1,6 @@
-# gdoc-sync
+# gdoc-sync — a Claude Code skill
 
-**Sync a Markdown file to an existing Google Doc — with working internal anchor links, auto-resized images, and optional RTL for Hebrew/Arabic.**
-
-Also packaged as a [Claude Code](https://claude.com/claude-code) skill.
+Sync a local Markdown file to an existing Google Doc — with working internal anchor links, auto-resized images, and optional RTL paragraph direction for Hebrew/Arabic docs. Packaged as both a standalone CLI and a [Claude Code](https://claude.com/claude-code) skill.
 
 ---
 
