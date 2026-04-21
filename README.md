@@ -36,8 +36,8 @@ One command, three API calls, a doc that works.
 pip install google-auth
 
 # Clone this repo
-git clone https://github.com/shaharsha/gdoc-sync.git
-cd gdoc-sync
+git clone https://github.com/shaharsha/claude-skill-gdoc-sync.git
+cd claude-skill-gdoc-sync
 
 # Run
 scripts/sync-gdoc.py path/to/your.md \
