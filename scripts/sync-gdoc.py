@@ -153,7 +153,7 @@ def push_markdown(token: str, doc_id: str, md_path: str) -> None:
     """Step 1: PATCH the markdown via Drive upload API. Google converts natively."""
     with open(md_path, "rb") as f:
         content = f.read()
-    url = f"https://www.googleapis.com/upload/drive/v3/files/{doc_id}?uploadType=media"
+    url = f"https://www.googleapis.com/upload/drive/v3/files/{doc_id}?uploadType=media&supportsAllDrives=true"
     api(token, "PATCH", url, body=content, content_type="text/markdown")
     print(f"[1/4] Pushed markdown: {md_path} ({len(content):,} bytes)")
 
