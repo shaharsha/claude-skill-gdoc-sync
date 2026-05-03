@@ -6,11 +6,12 @@ Sync a local Markdown file to an existing Google Doc — with working internal a
 
 ## Why
 
-Google Docs has a native "import from markdown" endpoint — great for the first 80% of the conversion — but it falls over on three things:
+Google Docs has a native "import from markdown" endpoint — great for the first 80% of the conversion — but it falls over on four things:
 
 1. **Internal anchor links like `[see §5](#section-5)`** get imported as *URL links* pointing at the literal string `#section-5` (broken). They should be native heading links.
-2. **Inline images** get imported at their source resolution (often 1500+ pt wide), which destroys page layout.
-3. **Paragraph direction** is never set. Hebrew / Arabic markdown content renders LTR — every paragraph needs `direction: RIGHT_TO_LEFT` applied after import.
+2. **Cross-doc links like `[see §5 in plan](other.md#anchor)`** import as URL links pointing at a literal markdown filename (broken). They should deep-link into the sibling Doc.
+3. **Inline images** get imported at their source resolution (often 1500+ pt wide), which destroys page layout.
+4. **Paragraph direction** is never set. Hebrew / Arabic markdown content renders LTR — every paragraph needs `direction: RIGHT_TO_LEFT` applied after import.
 
 `gdoc-sync` is a single Python script that does the import **plus** all three post-processing passes, so the resulting Doc actually looks like your markdown intended.
 
@@ -41,7 +42,8 @@ cd claude-skill-gdoc-sync
 scripts/sync-gdoc.py path/to/your.md \
   --doc-id <GOOGLE_DOC_ID> \
   --sa-key path/to/service-account.json \
-  [--rtl] [--no-links] [--max-image-width 300]
+  [--rtl] [--no-links] [--max-image-width 300] \
+  [--cross-doc-map "other.md=OTHER_DOC_ID" ...]
 ```
 
 The doc ID is the long string in the URL: `https://docs.google.com/document/d/` **`1lSsp...FDU-BEE`** `/edit`.

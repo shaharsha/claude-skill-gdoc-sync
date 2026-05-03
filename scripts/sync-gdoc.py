@@ -4,12 +4,16 @@ Sync a markdown file to an existing Google Doc.
 
 Pipeline:
   1. PATCH the markdown via Drive upload API (Google converts natively)
-  2. Rewrite broken anchor links [text](#slug) -> native headingId links
-  3. Resize oversized inline images (Google imports at source resolution)
-  4. Optionally apply RTL paragraph direction (for Hebrew/Arabic docs)
+  2. Rewrite broken in-doc anchor links [text](#slug) -> native headingId links
+  3. Rewrite cross-doc links [text](other.md#anchor) -> deep-links into the
+     sibling Doc, when --cross-doc-map is provided
+  4. Resize oversized inline images (Google imports at source resolution)
+  5. Optionally apply RTL paragraph direction (for Hebrew/Arabic docs)
 
 Usage:
-    ./sync-gdoc.py <markdown-file> --doc-id <FILE_ID> [--sa-key <path>] [--rtl] [--no-links] [--max-image-width <pt>]
+    ./sync-gdoc.py <markdown-file> --doc-id <FILE_ID> [--sa-key <path>] [--rtl]
+        [--no-links] [--max-image-width <pt>]
+        [--cross-doc-map "name.md=DOC_ID" ...]
 
 Auth (two supported paths):
     1. Service account (recommended): pass --sa-key path/to/sa.json. The SA
@@ -33,6 +37,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 
@@ -45,6 +50,53 @@ BASE_DELAY = 1.5  # seconds; exponential backoff
 HEADING_NUM_RE = re.compile(r"^(\d+(?:\.\d+)*)\b")
 LINK_TEXT_NUM_RE = re.compile(r"(\d+(?:\.\d+)*)")
 MARKDOWN_IMAGE_RE = re.compile(r"!\[[^\]]*\]\(([^)]+)\)")
+
+
+def google_slugify(text: str) -> str:
+    """Mimic the slug Google's markdown import generates for a heading.
+
+    "5.1 עקרונות מנחים" -> "51-עקרונות-מנחים"
+    "12.1 Milestone 1 - MVP" -> "121-milestone-1---mvp"
+    "16.2 Technical (חוסם Technical Design)" -> "162-technical-חוסם-technical-design"
+
+    Rules: lowercase, drop punctuation that isn't `\\w`/space/dash/slash, slashes
+    become dashes (treated like word separators), runs of whitespace collapse
+    into a single dash, leading/trailing dashes trimmed. Hebrew/Arabic/CJK are
+    preserved via re.UNICODE.
+    """
+    s = text.lower()
+    s = s.replace("/", " ")
+    # Drop everything that isn't a word char, whitespace, or dash
+    s = re.sub(r"[^\w\s-]", "", s, flags=re.UNICODE)
+    s = re.sub(r"\s+", "-", s)
+    return s.strip("-")
+
+
+def fetch_target_doc_headings(token: str, target_doc_id: str):
+    """Get a target Doc's headings as (slug_map, section_map). Cached per call site."""
+    doc = api(token, "GET", f"https://docs.googleapis.com/v1/documents/{target_doc_id}")
+    slug_map = {}
+    section_map = {}
+    for elem in doc["body"]["content"]:
+        p = elem.get("paragraph")
+        if not p:
+            continue
+        ps = p.get("paragraphStyle", {})
+        if not ps.get("namedStyleType", "").startswith("HEADING_"):
+            continue
+        hid = ps.get("headingId")
+        if not hid:
+            continue
+        text = "".join(
+            e.get("textRun", {}).get("content", "")
+            for e in p.get("elements", [])
+        ).strip()
+        slug_map[google_slugify(text)] = hid
+        m = HEADING_NUM_RE.match(text)
+        if m:
+            # Don't overwrite if multiple headings start with the same number
+            section_map.setdefault(m.group(1), hid)
+    return slug_map, section_map
 
 
 SA_SCOPES = [
@@ -155,7 +207,7 @@ def push_markdown(token: str, doc_id: str, md_path: str) -> None:
         content = f.read()
     url = f"https://www.googleapis.com/upload/drive/v3/files/{doc_id}?uploadType=media&supportsAllDrives=true"
     api(token, "PATCH", url, body=content, content_type="text/markdown")
-    print(f"[1/4] Pushed markdown: {md_path} ({len(content):,} bytes)")
+    print(f"[1/5] Pushed markdown: {md_path} ({len(content):,} bytes)")
 
 
 def fix_anchor_links(token: str, doc_id: str) -> int:
@@ -227,7 +279,109 @@ def fix_anchor_links(token: str, doc_id: str) -> int:
     if requests:
         api(token, "POST", f"https://docs.googleapis.com/v1/documents/{doc_id}:batchUpdate",
             body={"requests": requests})
-    print(f"[2/4] Fixed {len(requests)} anchor links")
+    print(f"[2/5] Fixed {len(requests)} in-doc anchor links")
+    return len(requests)
+
+
+def fix_cross_doc_links(token: str, doc_id: str, cross_doc_map: dict) -> int:
+    """Step 3: rewrite [text](other.md#anchor) cross-doc references into proper
+    deep-links pointing at the corresponding sibling Google Doc + heading ID.
+
+    cross_doc_map: {markdown_filename_or_path_fragment: target_doc_id}.
+    Match is by substring on the URL-decoded link URL — so any path that
+    contains the key matches. Anchor resolution tries (in order):
+      1. Slug match — google_slugify(target_heading_text) == anchor
+      2. Section number match — extract leading number from anchor or link text
+      3. Fallback — link to the target Doc's top with no anchor
+
+    Returns count of links rewritten.
+    """
+    if not cross_doc_map:
+        print("[3/5] Skipped cross-doc link rewriting (no --cross-doc-map)")
+        return 0
+
+    # Fetch heading maps for each target Doc once
+    target_caches = {}
+    for path, target_id in cross_doc_map.items():
+        slug_map, section_map = fetch_target_doc_headings(token, target_id)
+        target_caches[path] = (target_id, slug_map, section_map)
+
+    doc = api(token, "GET", f"https://docs.googleapis.com/v1/documents/{doc_id}")
+
+    requests = []
+
+    def process_element(e):
+        tr = e.get("textRun")
+        if not tr:
+            return
+        link = tr.get("textStyle", {}).get("link")
+        if not link:
+            return
+        url = link.get("url", "")
+        if not url:
+            return
+        decoded_url = urllib.parse.unquote(url)
+        # Find a matching cross-doc path
+        for path, (target_id, slug_map, section_map) in target_caches.items():
+            if path not in decoded_url:
+                continue
+            # Extract anchor portion (after #), if any
+            anchor = ""
+            if "#" in decoded_url:
+                anchor = decoded_url.rsplit("#", 1)[1]
+            # 1. Try slug match
+            hid = slug_map.get(anchor) if anchor else None
+            # 2. Try section number from anchor leading digits
+            if not hid and anchor:
+                m = re.match(r"(\d+)(?:[-.]|$)", anchor)
+                if m:
+                    raw = m.group(1)
+                    # The slug strips dots: "162" could be "16.2" or "1.6.2".
+                    # Try the longest matching prefix that exists in section_map.
+                    for k in range(len(raw), 0, -1):
+                        for split in range(1, k + 1):
+                            cand = raw[:split] + "." + raw[split:k] if split < k else raw[:k]
+                            if cand in section_map:
+                                hid = section_map[cand]
+                                break
+                        if hid:
+                            break
+            # 3. Try section number from link text
+            if not hid:
+                text = tr.get("content", "")
+                m = LINK_TEXT_NUM_RE.search(text)
+                if m:
+                    hid = section_map.get(m.group(1))
+            # Build new URL
+            if hid:
+                new_url = f"https://docs.google.com/document/d/{target_id}/edit#heading={hid}"
+            else:
+                new_url = f"https://docs.google.com/document/d/{target_id}/edit"
+            requests.append({"updateTextStyle": {
+                "range": {"startIndex": e["startIndex"], "endIndex": e["endIndex"]},
+                "textStyle": {"link": {"url": new_url}},
+                "fields": "link",
+            }})
+            return  # only one match per link
+
+    def walk(content_list):
+        for elem in content_list:
+            p = elem.get("paragraph")
+            if p:
+                for e in p.get("elements", []):
+                    process_element(e)
+            tbl = elem.get("table")
+            if tbl:
+                for row in tbl.get("tableRows", []):
+                    for cell in row.get("tableCells", []):
+                        walk(cell.get("content", []))
+
+    walk(doc["body"]["content"])
+
+    if requests:
+        api(token, "POST", f"https://docs.googleapis.com/v1/documents/{doc_id}:batchUpdate",
+            body={"requests": requests})
+    print(f"[3/5] Fixed {len(requests)} cross-doc links")
     return len(requests)
 
 
@@ -307,12 +461,12 @@ def resize_oversized_images(token: str, doc_id: str, md_path: str, max_width_pt:
             ]})
         resized += 1
 
-    print(f"[3/4] Resized {resized} oversized images (max width {max_width_pt}pt)")
+    print(f"[4/5] Resized {resized} oversized images (max width {max_width_pt}pt)")
     return resized
 
 
 def apply_rtl(token: str, doc_id: str) -> None:
-    """Step 4 (optional): set RIGHT_TO_LEFT direction on all body paragraphs."""
+    """Step 5 (optional): set RIGHT_TO_LEFT direction on all body paragraphs."""
     doc = api(token, "GET", f"https://docs.googleapis.com/v1/documents/{doc_id}")
     end = doc["body"]["content"][-1]["endIndex"]
     api(token, "POST", f"https://docs.googleapis.com/v1/documents/{doc_id}:batchUpdate",
@@ -323,7 +477,7 @@ def apply_rtl(token: str, doc_id: str) -> None:
                 "fields": "direction",
             }
         }]})
-    print(f"[4/4] Applied RTL across doc (1..{end - 1})")
+    print(f"[5/5] Applied RTL across doc (1..{end - 1})")
 
 
 def main() -> int:
@@ -342,7 +496,17 @@ def main() -> int:
                         help="Skip anchor-link rewriting (step 2)")
     parser.add_argument("--max-image-width", type=float, default=300.0,
                         help="Max inline image width in points (default 300pt); wider images are resized preserving aspect ratio. Set 0 to skip.")
+    parser.add_argument("--cross-doc-map", action="append", default=[], metavar="NAME=DOC_ID",
+                        help="Map a markdown filename (or path fragment that appears in cross-doc link URLs) to a sibling Google Doc ID. Repeatable. Cross-doc links are rewritten to deep-link into the target Doc's heading. Example: --cross-doc-map 'product-plan.md=1lSsp...'")
     args = parser.parse_args()
+
+    cross_doc_map = {}
+    for entry in args.cross_doc_map:
+        if "=" not in entry:
+            print(f"error: --cross-doc-map expects NAME=DOC_ID, got {entry!r}", file=sys.stderr)
+            return 1
+        name, did = entry.split("=", 1)
+        cross_doc_map[name.strip()] = did.strip()
 
     if not os.path.isfile(args.markdown):
         print(f"error: markdown file not found: {args.markdown}", file=sys.stderr)
@@ -354,18 +518,20 @@ def main() -> int:
 
     if not args.no_links:
         fix_anchor_links(token, args.doc_id)
+        fix_cross_doc_links(token, args.doc_id, cross_doc_map)
     else:
-        print("[2/4] Skipped anchor-link rewriting (--no-links)")
+        print("[2/5] Skipped in-doc anchor rewriting (--no-links)")
+        print("[3/5] Skipped cross-doc rewriting (--no-links)")
 
     if args.max_image_width > 0:
         resize_oversized_images(token, args.doc_id, args.markdown, args.max_image_width)
     else:
-        print("[3/4] Skipped image resize (--max-image-width 0)")
+        print("[4/5] Skipped image resize (--max-image-width 0)")
 
     if args.rtl:
         apply_rtl(token, args.doc_id)
     else:
-        print("[4/4] Skipped RTL (use --rtl to enable)")
+        print("[5/5] Skipped RTL (use --rtl to enable)")
 
     print(f"Done. https://docs.google.com/document/d/{args.doc_id}/edit")
     return 0
